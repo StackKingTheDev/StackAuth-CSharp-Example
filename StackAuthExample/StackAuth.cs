@@ -2,6 +2,7 @@
 // HTTPS certificate and hostname validation is provided by HttpClient.
 // https://auth.stackworkshop.com/docs/
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -23,7 +24,8 @@ public sealed class StackAuthException : Exception
 }
 
 /// <summary>A protected file or update package: the signed SHA-256 plus a short-lived download ticket.</summary>
-public sealed record StackAuthFile(string Name, string MimeType, long Size, string Sha256, string DownloadPath);
+public sealed record StackAuthFile(string Name, string MimeType, long Size, string Sha256, string DownloadPath,
+    bool Encrypted = false, long PlaintextSize = 0, string PlaintextSha256 = "");
 
 public sealed class StackAuth
 {
@@ -63,9 +65,9 @@ public sealed class StackAuth
         if (service.Scheme != Uri.UriSchemeHttps && service.Host is not ("localhost" or "127.0.0.1" or "::1"))
             throw new ArgumentException("baseUrl must use HTTPS so its certificate and hostname are verified.", nameof(baseUrl));
         _http = new HttpClient { BaseAddress = service, Timeout = TimeSpan.FromSeconds(15) };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("StackAuthClient/1.5");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd("StackAuthClient/1.8");
         _downloads = new HttpClient { BaseAddress = service, Timeout = TimeSpan.FromMinutes(30) };
-        _downloads.DefaultRequestHeaders.UserAgent.ParseAdd("StackAuthClient/1.5");
+        _downloads.DefaultRequestHeaders.UserAgent.ParseAdd("StackAuthClient/1.8");
     }
 
     private static string Hex(byte[] bytes) => Convert.ToHexString(bytes).ToLowerInvariant();
@@ -213,12 +215,45 @@ public sealed class StackAuth
 
     // ---- variables
 
-    public async Task<string?> VariableAsync(string name)
+    private static string DecryptCredentialVariable(JsonElement envelope, string username, string password)
     {
+        try
+        {
+            if (envelope.GetProperty("version").GetInt32() != 1 ||
+                envelope.GetProperty("algorithm").GetString() != "AES-256-GCM" ||
+                envelope.GetProperty("kdf").GetString() != "PBKDF2-SHA256")
+                throw new CryptographicException("Unsupported envelope.");
+            var salt = Convert.FromBase64String(envelope.GetProperty("salt").GetString()!);
+            var iv = Convert.FromBase64String(envelope.GetProperty("iv").GetString()!);
+            var tag = Convert.FromBase64String(envelope.GetProperty("tag").GetString()!);
+            var ciphertext = Convert.FromBase64String(envelope.GetProperty("ciphertext").GetString()!);
+            var credential = Encoding.UTF8.GetBytes(username + "\0" + password);
+            var key = Rfc2898DeriveBytes.Pbkdf2(credential, salt, envelope.GetProperty("iterations").GetInt32(),
+                HashAlgorithmName.SHA256, 32);
+            var plaintext = new byte[ciphertext.Length];
+#pragma warning disable SYSLIB0053 // .NET 6/7 compatibility; newer runtimes prefer AesGcm(key, 16).
+            using var aes = new AesGcm(key);
+#pragma warning restore SYSLIB0053
+            aes.Decrypt(iv, ciphertext, tag, plaintext, Encoding.UTF8.GetBytes("StackWorkShop Auth credential variable v1"));
+            return Encoding.UTF8.GetString(plaintext);
+        }
+        catch (Exception error) when (error is CryptographicException or FormatException or KeyNotFoundException)
+        {
+            throw new StackAuthException("VARIABLE_DECRYPT_FAILED", "The encrypted variable could not be decrypted with these credentials.");
+        }
+    }
+
+    public async Task<string?> VariableAsync(string name, string? username = null, string? password = null)
+    {
+        var payload = new Dictionary<string, object?> { ["name"] = name, ["username"] = username, ["password"] = password };
         var data = SessionToken is null
-            ? await CallAsync("var", new() { ["name"] = name, ["init_token"] = InitToken })
-            : await SessionCallAsync("var", new() { ["name"] = name });
-        return data.GetProperty("value").GetString();
+            ? await CallAsync("var", new(payload) { ["init_token"] = InitToken })
+            : await SessionCallAsync("var", payload);
+        if (!data.TryGetProperty("encrypted", out var encrypted) || !encrypted.GetBoolean())
+            return data.GetProperty("value").GetString();
+        if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(password))
+            throw new StackAuthException("VARIABLE_CREDENTIALS_REQUIRED", "Pass username and password to read this credential-encrypted variable.");
+        return DecryptCredentialVariable(data.GetProperty("envelope"), username, password);
     }
 
     public async Task<string?> GetUserVarAsync(string name) => (await SessionCallAsync("uservar/get", new() { ["name"] = name })).GetProperty("value").GetString();
@@ -250,7 +285,10 @@ public sealed class StackAuth
         data.TryGetProperty("mime_type", out var mime) ? mime.GetString() ?? "application/octet-stream" : "application/octet-stream",
         data.GetProperty("size").GetInt64(),
         data.GetProperty("sha256").GetString()!,
-        data.GetProperty("download_path").GetString()!);
+        data.GetProperty("download_path").GetString()!,
+        data.TryGetProperty("encrypted", out var encrypted) && encrypted.GetBoolean(),
+        data.TryGetProperty("plaintext_size", out var plainSize) ? plainSize.GetInt64() : data.GetProperty("size").GetInt64(),
+        data.TryGetProperty("plaintext_sha256", out var plainHash) ? plainHash.GetString() ?? "" : data.GetProperty("sha256").GetString()!);
 
     /// <summary>Signed metadata and a 5-minute download ticket for a protected file.</summary>
     public async Task<StackAuthFile> FileInfoAsync(string name)
@@ -270,14 +308,54 @@ public sealed class StackAuth
         return response;
     }
 
-    /// <summary>Downloads a protected file into memory and verifies its SHA-256 (e.g. for Assembly.Load).</summary>
+    private static byte[] FileHmac(byte[] key, params byte[][] parts)
+    {
+        using var hmac = new HMACSHA256(key);
+        foreach (var part in parts) hmac.TransformBlock(part, 0, part.Length, null, 0);
+        hmac.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+        return hmac.Hash!;
+    }
+
+    /// <summary>Decrypts a downloaded SWE1 container in memory; plaintext is never written to disk.</summary>
+    public byte[] DecryptFileBytes(string name, byte[] container)
+    {
+        if (container.Length < 68 || !container.AsSpan(0, 4).SequenceEqual(Encoding.ASCII.GetBytes("SWE1")))
+            throw new StackAuthException("FILE_DECRYPT_FAILED", "The encrypted file container is invalid.");
+        var salt = container.AsSpan(4, 16).ToArray();
+        var nonce = container.AsSpan(20, 16).ToArray();
+        var encrypted = container.AsSpan(36, container.Length - 68).ToArray();
+        var tag = container.AsSpan(container.Length - 32, 32).ToArray();
+        var context = Encoding.UTF8.GetBytes("\0" + _appId + "\0" + name);
+        var prk = FileHmac(salt, _secret);
+        var encryptionKey = FileHmac(prk, Encoding.UTF8.GetBytes("stackauth-file-encryption"), context, new byte[] { 1 });
+        var authenticationKey = FileHmac(prk, Encoding.UTF8.GetBytes("stackauth-file-authentication"), context, new byte[] { 1 });
+        var aad = Encoding.UTF8.GetBytes(_appId + "\0" + name);
+        var expected = FileHmac(authenticationKey, container.AsSpan(0, 36).ToArray(), encrypted, aad);
+        if (!CryptographicOperations.FixedTimeEquals(tag, expected))
+            throw new StackAuthException("FILE_DECRYPT_FAILED", "The encrypted file failed authentication.");
+        var plain = new byte[encrypted.Length];
+        Span<byte> counter = stackalloc byte[4];
+        for (var offset = 0; offset < encrypted.Length; offset += 32)
+        {
+            BinaryPrimitives.WriteUInt32BigEndian(counter, (uint)(offset / 32));
+            var stream = FileHmac(encryptionKey, nonce, counter.ToArray());
+            var length = Math.Min(32, encrypted.Length - offset);
+            for (var index = 0; index < length; index++) plain[offset + index] = (byte)(encrypted[offset + index] ^ stream[index]);
+        }
+        return plain;
+    }
+
+    /// <summary>Downloads and verifies a file; encrypted files are decrypted only in memory.</summary>
     public async Task<byte[]> FileBytesAsync(string name)
     {
         var file = await FileInfoAsync(name);
         using var response = await OpenDownloadAsync(file);
-        var bytes = await response.Content.ReadAsByteArrayAsync();
-        if (bytes.LongLength != file.Size || !CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(Hex(SHA256.HashData(bytes))), Encoding.ASCII.GetBytes(file.Sha256)))
+        var container = await response.Content.ReadAsByteArrayAsync();
+        if (container.LongLength != file.Size || !CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(Hex(SHA256.HashData(container))), Encoding.ASCII.GetBytes(file.Sha256)))
             throw new StackAuthException("FILE_HASH_MISMATCH", "The downloaded file does not match its signed SHA-256.");
+        var bytes = file.Encrypted ? DecryptFileBytes(name, container) : container;
+        if (bytes.LongLength != file.PlaintextSize || !CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(Hex(SHA256.HashData(bytes))), Encoding.ASCII.GetBytes(file.PlaintextSha256)))
+            throw new StackAuthException("FILE_HASH_MISMATCH", "The decrypted file does not match its signed SHA-256.");
         return bytes;
     }
 
@@ -321,6 +399,54 @@ public sealed class StackAuth
         var info = await UpdateAsync();
         if (info.GetProperty("mode").GetString() != "file") return null;
         return await StreamToAsync(FileFrom(info), destination);
+    }
+
+    // ---- custom scripts (plain text; dashboard -> Scripts)
+
+    /// <summary>Reads a custom script as text. paramsIn must match its "Send login in" setting.</summary>
+    public async Task<string> ScriptAsync(string scriptId, string method = "GET", string paramsIn = "headers")
+    {
+        method = method.ToUpperInvariant();
+        paramsIn = paramsIn.ToLowerInvariant();
+        if ((method != "GET" && method != "POST") || (paramsIn != "headers" && paramsIn != "url" && paramsIn != "body")
+            || (method == "GET" && paramsIn == "body"))
+            throw new StackAuthException("INVALID_INPUT", "Use GET or POST; paramsIn must be headers or url (POST also allows body).");
+
+        async Task<string> RunAsync()
+        {
+            var path = $"/api/v1/scripts/{Uri.EscapeDataString(_appId)}/{Uri.EscapeDataString(scriptId)}";
+            var fields = new Dictionary<string, string>();
+            if (!string.IsNullOrEmpty(SessionToken)) fields["token"] = SessionToken;
+            if (!string.IsNullOrEmpty(Hwid)) fields["hwid"] = Hwid;
+            var encoded = string.Join("&", fields.Select(p => $"{Uri.EscapeDataString(p.Key)}={Uri.EscapeDataString(p.Value)}"));
+            if (paramsIn == "url" && encoded.Length > 0) path += "?" + encoded;
+            using var request = new HttpRequestMessage(method == "POST" ? HttpMethod.Post : HttpMethod.Get, path);
+            if (paramsIn == "headers")
+            {
+                if (!string.IsNullOrEmpty(SessionToken)) request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + SessionToken);
+                if (!string.IsNullOrEmpty(Hwid)) request.Headers.TryAddWithoutValidation("X-Hwid", Hwid);
+            }
+            else if (paramsIn == "body")
+                request.Content = new StringContent(encoded, Encoding.UTF8, "application/x-www-form-urlencoded");
+
+            using var response = await _http.SendAsync(request);
+            var text = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                var code = response.Headers.TryGetValues("X-StackAuth-Error", out var codes) ? codes.First() : $"HTTP_{(int)response.StatusCode}";
+                var message = response.Headers.TryGetValues("X-StackAuth-Message", out var messages)
+                    ? Uri.UnescapeDataString(messages.First()) : text.Trim();
+                throw new StackAuthException(code, message);
+            }
+            return text;
+        }
+
+        try { return await RunAsync(); }
+        catch (StackAuthException error) when (RefreshableErrors.Contains(error.Code) && RefreshToken is not null)
+        {
+            await RefreshAsync();
+            return await RunAsync();
+        }
     }
 
     // ---- in-app staff panel (Member.staff is true; Settings → Staff level)
