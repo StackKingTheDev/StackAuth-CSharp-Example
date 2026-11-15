@@ -55,3 +55,16 @@ Every button is one SDK call, so you can copy the handler you need.
 Docs: [auth.stackworkshop.com/docs](https://auth.stackworkshop.com/docs/) · Other examples: [PHP](https://github.com/StackKingTheDev/StackAuth-PHP-Example) · [Node](https://github.com/StackKingTheDev/StackAuth-Node-Example)
 
 MIT licensed.
+
+## Variable templates and credential encryption
+
+Variable values can reference the signed-in member and other variables, for example `Welcome {client.username} to {var.appname}!`. Templates resolve on the Auth server after the normal access checks.
+
+For a secured variable with **Credential-encrypted response** enabled, call it after login with the same member credentials:
+
+```csharp
+string? welcome = await auth.VariableAsync(
+    "welcome_message_afterlogin", username, password);
+```
+
+The SDK decrypts the AES-256-GCM response in memory. The stored password hash is never sent to the client, and Fake mode returns the same encrypted envelope shape with the fake value.
